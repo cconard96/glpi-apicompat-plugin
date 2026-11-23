@@ -45,6 +45,18 @@ function plugin_init_apicompat()
                     $add_hooks = [];
                     $update_hooks = [];
                     $prepare_hooks = [];
+                    $purge_hooks = [];
+                    // Restrict the requested tags to those valid for the item (see TagController::filterTagValuesForItem()).
+                    // If tags were requested but none are valid, the request is ignored rather than clearing the existing tags.
+                    $fn_filterTagValues = static function (CommonDBTM $item): void {
+                        $requested = (array) $item->input['_plugin_tag_tag_values'];
+                        $valid = TagController::filterTagValuesForItem($item, $requested);
+                        if ($valid === [] && $requested !== []) {
+                            unset($item->input['_plugin_tag_tag_values']);
+                        } else {
+                            $item->input['_plugin_tag_tag_values'] = $valid;
+                        }
+                    };
                     if ($plugin === 'tag') {
                         $supported_itemtypes = [];
                         foreach ($CFG_GLPI['plugin_tag_itemtypes'] as $itemtypes) {
@@ -52,31 +64,57 @@ function plugin_init_apicompat()
                         }
 
                         foreach ($supported_itemtypes as $itemtype) {
+                            if (!PluginTagTag::canItemtype($itemtype)) {
+                                continue;
+                            }
                             // Need to add hooks for this meta-plugin rather than overriding the 'tag' plugin hooks
                             // because it only adds them in the post-init phase and only after trying to guess the current itemtype from the request URL
                             // We also need to ensure our hooks are first in the list
-                            $add_hooks[$itemtype] = static function (CommonDBTM $item) {
-                                $item->input['_plugin_tag_tag_process_form'] = 1;
-                                $item->input['__plugin_tag_tag_values_defined'] = 1;
-                            };
-                            // CommonDBTM::update() skips updateInDB() and ITEM_UPDATE when no actual field changed (e.g. PATCH with only "tags").
-                            // Force a change on date_mod (after prepareInputForUpdate) so the normal post-update path runs.
-                            // This way tags are only touched once the update has succeeded.
-                            $prepare_hooks[$itemtype] = static function (CommonDBTM $item) {
-                                if (is_array($item->input) && array_key_exists('_plugin_tag_tag_values', $item->input)) {
-                                    $item->input['date_mod'] = $_SESSION['glpi_currenttime'];
+                            // Tag's updateItem() skips its own canUpdate() check when _plugin_tag_tag_process_form is set,
+                            // so the right must be enforced here before setting the flags.
+                            $add_hooks[$itemtype] = static function (CommonDBTM $item) use ($fn_filterTagValues) {
+                                if (!array_key_exists('_plugin_tag_tag_values', $item->input ?? [])) {
+                                    return;
                                 }
-                            };
-                            $update_hooks[$itemtype] = static function (CommonDBTM $item) {
-                                if (array_key_exists('_plugin_tag_tag_values', $item->input ?? [])) {
+                                if (PluginTagTag::canUpdate()) {
+                                    $fn_filterTagValues($item);
+                                }
+                                if (array_key_exists('_plugin_tag_tag_values', $item->input) && PluginTagTag::canUpdate()) {
                                     $item->input['_plugin_tag_tag_process_form'] = 1;
                                     $item->input['__plugin_tag_tag_values_defined'] = 1;
                                 }
                             };
+                            // CommonDBTM::update() skips updateInDB() and ITEM_UPDATE when no actual field changed (e.g. PATCH with only "tags").
+                            // Force a change on date_mod (after prepareInputForUpdate) so the normal post-update path runs.
+                            // This way tags are only touched once the update has succeeded.
+                            // Without the tag update right, the tag values are discarded so date_mod isn't bumped for nothing.
+                            $prepare_hooks[$itemtype] = static function (CommonDBTM $item) use ($fn_filterTagValues) {
+                                if (!is_array($item->input) || !array_key_exists('_plugin_tag_tag_values', $item->input)) {
+                                    return;
+                                }
+                                if (!PluginTagTag::canUpdate()) {
+                                    unset($item->input['_plugin_tag_tag_values']);
+                                    return;
+                                }
+                                $fn_filterTagValues($item);
+                                if (array_key_exists('_plugin_tag_tag_values', $item->input)) {
+                                    $item->input['date_mod'] = $_SESSION['glpi_currenttime'];
+                                }
+                            };
+                            $update_hooks[$itemtype] = static function (CommonDBTM $item) {
+                                if (array_key_exists('_plugin_tag_tag_values', $item->input ?? []) && PluginTagTag::canUpdate()) {
+                                    $item->input['_plugin_tag_tag_process_form'] = 1;
+                                    $item->input['__plugin_tag_tag_values_defined'] = 1;
+                                }
+                            };
+                            // Tag only registers purge hooks for the itemtype guessed from the request URL (and Ticket/Form),
+                            // which never resolves for API requests. Without this, tag links are orphaned when an item is purged.
+                            $purge_hooks[$itemtype] = [PluginTagTagItem::class, 'purgeItem'];
                         }
                         $PLUGIN_HOOKS[Hooks::ITEM_ADD] = ['apicompat' => $add_hooks] + ($PLUGIN_HOOKS[Hooks::ITEM_ADD] ?? []);
                         $PLUGIN_HOOKS[Hooks::POST_PREPAREUPDATE] = ['apicompat' => $prepare_hooks] + ($PLUGIN_HOOKS[Hooks::POST_PREPAREUPDATE] ?? []);
                         $PLUGIN_HOOKS[Hooks::ITEM_UPDATE] = ['apicompat' => $update_hooks] + ($PLUGIN_HOOKS[Hooks::ITEM_UPDATE] ?? []);
+                        $PLUGIN_HOOKS[Hooks::PRE_ITEM_PURGE] = ['apicompat' => $purge_hooks] + ($PLUGIN_HOOKS[Hooks::PRE_ITEM_PURGE] ?? []);
                     }
                 }
             }
